@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+  <rect width="192" height="192" rx="32" fill="#1a1a2e"/>
+  <g fill="none">
+    <!-- 5×5 grid of dots representing the LED wall -->
+    <circle cx="48"  cy="48"  r="10" fill="#e94560"/>
+    <circle cx="80"  cy="48"  r="10" fill="#f5a623"/>
+    <circle cx="112" cy="48"  r="10" fill="#f8e71c"/>
+    <circle cx="144" cy="48"  r="10" fill="#7ed321"/>
+    <circle cx="48"  cy="80"  r="10" fill="#4a90d9"/>
+    <circle cx="80"  cy="80"  r="10" fill="#bd10e0"/>
+    <circle cx="112" cy="80"  r="10" fill="#e94560"/>
+    <circle cx="144" cy="80"  r="10" fill="#4a90d9"/>
+    <circle cx="48"  cy="112" r="10" fill="#f5a623"/>
+    <circle cx="80"  cy="112" r="10" fill="#7ed321"/>
+    <circle cx="112" cy="112" r="10" fill="#bd10e0"/>
+    <circle cx="144" cy="112" r="10" fill="#f8e71c"/>
+    <circle cx="48"  cy="144" r="10" fill="#7ed321"/>
+    <circle cx="80"  cy="144" r="10" fill="#e94560"/>
+    <circle cx="112" cy="144" r="10" fill="#f5a623"/>
+    <circle cx="144" cy="144" r="10" fill="#4a90d9"/>
+  </g>
+</svg>

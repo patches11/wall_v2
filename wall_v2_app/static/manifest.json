@@ -1,0 +1,25 @@
+{
+  "name": "Wall v2",
+  "short_name": "Wall",
+  "description": "Control panel for the 25×25 LED wall display",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0a0a",
+  "theme_color": "#1a1a2e",
+  "start_url": "/",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/static/icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
