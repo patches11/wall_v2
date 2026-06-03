@@ -1,5 +1,5 @@
 // Service worker — cache-first for static assets, network-only for /ws and /api.
-const CACHE = "wall-v2-v1";
+const CACHE = "wall-v2-v2";
 const PRECACHE = ["/", "/static/app.js", "/static/draw.js", "/static/camera.js", "/static/sensors.js", "/static/manifest.json"];
 
 self.addEventListener("install", e =>

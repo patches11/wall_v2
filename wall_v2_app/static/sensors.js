@@ -62,6 +62,7 @@
 
   function stopGravBall() {
     gravActive = false;
+    trailBuf.fill(0);
     const toggle = document.getElementById("grav-toggle");
     if (toggle) toggle.checked = false;
     document.getElementById("grav-status").textContent = "Gravity ball: off";
@@ -87,6 +88,57 @@
     e.target.checked ? startGravBall() : stopGravBall();
   });
 
+  // ── Ball rendering helpers ────────────────────────────────────────────
+
+  // Persistent trail buffer — not cleared each frame, faded instead
+  const trailBuf = new Uint8Array(1875);
+
+  // Convert HSV (h 0-360, s/v 0-1) to [r,g,b] 0-255
+  function hsvToRgb(h, s, v) {
+    const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+    let r = 0, g = 0, b = 0;
+    if      (h < 60)  { r=c; g=x; }
+    else if (h < 120) { r=x; g=c; }
+    else if (h < 180) { g=c; b=x; }
+    else if (h < 240) { g=x; b=c; }
+    else if (h < 300) { r=x; b=c; }
+    else              { r=c; b=x; }
+    return [Math.round((r+m)*255), Math.round((g+m)*255), Math.round((b+m)*255)];
+  }
+
+  // Map speed (px/frame) to a hue: slow = deep blue (220°), fast = white-hot cyan (180°→0°)
+  function speedColor(speed) {
+    const t = Math.min(speed / 1.2, 1.0);
+    const h = 220 - t * 220;     // 220 (blue) → 0 (red) through cyan
+    const s = 1.0 - t * 0.4;    // desaturates slightly at high speed
+    const v = 0.4 + t * 0.6;    // dim when slow, bright when fast
+    return hsvToRgb(h, s, v);
+  }
+
+  function renderBall() {
+    // Fade the trail each frame
+    for (let i = 0; i < trailBuf.length; i++) trailBuf[i] = (trailBuf[i] * 3 >> 2);
+
+    const bx = Math.round(ballX), by = Math.round(ballY);
+    const speed = Math.hypot(velX, velY);
+    const [r, g, b] = speedColor(speed);
+
+    // 9-pixel cross glow: centre full, cardinals 50%, diagonals 25%
+    const glow = [
+      [0, 0, 1.0], [1,0,.5], [-1,0,.5], [0,1,.5], [0,-1,.5],
+      [1,1,.25], [-1,1,.25], [1,-1,.25], [-1,-1,.25]
+    ];
+    for (const [dx, dy, br] of glow) {
+      const gx = bx + dx, gy = by + dy;
+      if (gx < 0 || gx >= W || gy < 0 || gy >= H) continue;
+      const i = (gy * W + gx) * 3;
+      trailBuf[i]   = Math.min(255, trailBuf[i]   + ((r * br) | 0));
+      trailBuf[i+1] = Math.min(255, trailBuf[i+1] + ((g * br) | 0));
+      trailBuf[i+2] = Math.min(255, trailBuf[i+2] + ((b * br) | 0));
+    }
+    window.wallSendBinary?.(trailBuf.buffer);
+  }
+
   function gravTick(ts) {
     if (!gravActive) return;
     gravRaf = requestAnimationFrame(gravTick);
@@ -100,23 +152,10 @@
     ballX = Math.max(0, Math.min(24, ballX + velX));
     ballY = Math.max(0, Math.min(24, ballY + velY));
 
-    // Bounce off walls
     if (ballX <= 0 || ballX >= 24) velX *= -0.6;
     if (ballY <= 0 || ballY >= 24) velY *= -0.6;
 
-    // Render 25×25 frame
-    const buf = new ArrayBuffer(1875);
-    const arr = new Uint8Array(buf);
-    // Fade background (by leaving it black)
-    const bx = Math.round(ballX), by = Math.round(ballY);
-    // Glow: centre + 4 neighbours
-    const glow = [[bx,by,255],[bx-1,by,80],[bx+1,by,80],[bx,by-1,80],[bx,by+1,80]];
-    for (const [gx, gy, bri] of glow) {
-      if (gx < 0 || gx >= W || gy < 0 || gy >= H) continue;
-      const i = (gy * W + gx) * 3;
-      arr[i] = bri; arr[i+1] = Math.floor(bri * 0.3); arr[i+2] = 0;
-    }
-    window.wallSendBinary?.(buf);
+    renderBall();
   }
 
   // ── Shake to next ─────────────────────────────────────────────────────
@@ -149,7 +188,13 @@
 
   function syncScrollSwatch() { scrollColorSwatch.style.background = scrollColorPicker.value; }
   scrollColorPicker.addEventListener("input", syncScrollSwatch);
-  scrollColorSwatch.addEventListener("click", () => scrollColorPicker.click());
+  // iOS fix: overlay input inside swatch (same pattern as draw.js color picker)
+  scrollColorSwatch.style.position = 'relative';
+  Object.assign(scrollColorPicker.style, {
+    position: 'absolute', top: '0', left: '0',
+    width: '100%', height: '100%', opacity: '0', cursor: 'pointer'
+  });
+  scrollColorSwatch.appendChild(scrollColorPicker);
   fpsSl.addEventListener("input", () => fpsLbl.textContent = fpsSl.value);
   syncScrollSwatch();
 

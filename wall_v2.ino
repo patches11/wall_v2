@@ -87,8 +87,10 @@ static uint8_t  gol[MATRIX_W][MATRIX_H];      // 0 = dead; 1–255 = age
 static uint8_t  golNext[MATRIX_W][MATRIX_H];
 
 #define VORONOI_SEEDS 6
-struct VoroSeed { float x, y, vx, vy; uint8_t hue; };
-static VoroSeed voroSeeds[VORONOI_SEEDS];
+struct VoroSeed { float cx, cy, rx, ry, fx, fy, px, py; };
+static VoroSeed   voroSeeds[VORONOI_SEEDS];
+static uint32_t   voroTick    = 0;
+static uint8_t    voroBaseHue = 0;
 
 #define NUM_BOIDS 16
 struct Boid { float x, y, vx, vy; uint8_t hue; };
@@ -115,13 +117,21 @@ void drawPlasma(uint32_t now) {
     static uint16_t t    = 0;
     if (!frameReady(now, last, 18)) return;
     uint8_t baseHue = t >> 4;
-    for (uint8_t y = 0; y < MATRIX_H; y++)
+    uint16_t t2 = t >> 1;           // half speed
+    uint16_t t3 = t + (t >> 1);     // 1.5× speed (incommensurate with t and t2)
+    for (uint8_t y = 0; y < MATRIX_H; y++) {
         for (uint8_t x = 0; x < MATRIX_W; x++) {
-            uint8_t wave = scale8(sin8(x * 12 + t),        85)
-                         + scale8(sin8(y * 11 - t),         85)
-                         + scale8(sin8((x - y) * 9 + t/2),  85);
+            uint8_t w1 = sin8(x *  9 + t);
+            uint8_t w2 = sin8(y * 11 - t);
+            // w3 is phase-warped by w1 — sin(sin(...)) breaks the tile structure
+            uint8_t w3 = sin8((x + y) * 6 + (w1 >> 3) + t2);
+            // w4 adds an off-axis rhythm at a third independent speed
+            uint8_t w4 = sin8(x * 4 - y * 7 + t3);
+            uint8_t wave = scale8(w1, 60) + scale8(w2, 60)
+                         + scale8(w3, 68) + scale8(w4, 67);
             leds[XY(x, y)] = CHSV(baseHue + (wave >> 3), 230, wave);
         }
+    }
     FastLED.show();
     t += 3;
 }
@@ -167,6 +177,8 @@ void initFire() { memset(heat, 0, sizeof(heat)); }
 void drawFire(uint32_t now) {
     static uint32_t last = 0;
     if (!frameReady(now, last, 25)) return;
+
+    // Vertical: cool, drift upward, stoke base
     for (uint8_t x = 0; x < MATRIX_W; x++) {
         for (uint8_t y = 0; y < MATRIX_H; y++)
             heat[x][y] = qsub8(heat[x][y], random8(5, 15));
@@ -174,6 +186,19 @@ void drawFire(uint32_t now) {
             heat[x][y] = (heat[x][y-1] + heat[x][y-2] + heat[x][y-2]) / 3;
         heat[x][0] = qadd8(heat[x][0], random8(80, 180));
     }
+
+    // Horizontal: blend each row with its neighbours so columns
+    // interact and the flame looks unified rather than striped.
+    static uint8_t rowBuf[MATRIX_W];
+    for (uint8_t y = 0; y < MATRIX_H; y++) {
+        for (uint8_t x = 0; x < MATRIX_W; x++) {
+            uint8_t l = heat[(x + MATRIX_W - 1) % MATRIX_W][y];
+            uint8_t r = heat[(x + 1)            % MATRIX_W][y];
+            rowBuf[x] = (heat[x][y] * 2 + l + r) / 4;
+        }
+        for (uint8_t x = 0; x < MATRIX_W; x++) heat[x][y] = rowBuf[x];
+    }
+
     for (uint8_t x = 0; x < MATRIX_W; x++)
         for (uint8_t y = 0; y < MATRIX_H; y++)
             leds[XY(x, MATRIX_H - 1 - y)] = HeatColor(heat[x][y]);
@@ -351,18 +376,32 @@ void drawGoL(uint32_t now) {
 }
 
 // 8. Voronoi Cells ────────────────────────────────────────────────
-// 6 seeds drift around the grid; each pixel is colored by its nearest
-// seed. Boundaries between cells are brightened. Each seed's hue
-// shifts slowly so the palette evolves over time.
+// 6 seeds trace Lissajous figures so each cell sweeps a flowing curve
+// rather than bouncing in a straight line. Hues are evenly spaced and
+// drift together — all cells shift colour in sync over ~30 s.
+// Intra-cell brightness is flat (no distance gradient) so colours read
+// clearly; boundaries stay bright white.
+
+// Lissajous frequency pairs — irrational ratios keep patterns aperiodic
+static const float voroFx[6] = {1.00f, 2.00f, 0.70f, 1.50f, 1.00f, 3.00f};
+static const float voroFy[6] = {1.30f, 3.00f, 1.10f, 1.00f, 2.00f, 2.00f};
+
 void initVoronoi() {
+    voroTick    = 0;
+    voroBaseHue = 0;
+    float cx = MATRIX_W / 2.0f, cy = MATRIX_H / 2.0f;
     for (uint8_t i = 0; i < VORONOI_SEEDS; i++) {
-        voroSeeds[i].x   = 2.0f + random8(MATRIX_W - 4);
-        voroSeeds[i].y   = 2.0f + random8(MATRIX_H - 4);
-        float angle      = random8() * 2.0f * 3.14159f / 256.0f;
-        float spd        = 0.03f + random8() * 0.02f / 255.0f;
-        voroSeeds[i].vx  = cosf(angle) * spd;
-        voroSeeds[i].vy  = sinf(angle) * spd;
-        voroSeeds[i].hue = i * (256 / VORONOI_SEEDS);
+        // Spread centres slightly so seeds don't all start together
+        voroSeeds[i].cx = cx + (random8() - 128) * 0.04f;
+        voroSeeds[i].cy = cy + (random8() - 128) * 0.04f;
+        // Orbit radii: 8–10 px so seeds always stay well within the grid
+        voroSeeds[i].rx = 8.0f + random8(3);
+        voroSeeds[i].ry = 8.0f + random8(3);
+        voroSeeds[i].fx = voroFx[i];
+        voroSeeds[i].fy = voroFy[i];
+        // Random phase offsets so seeds are spread around at t=0
+        voroSeeds[i].px = i * 1.047f + random8() * 0.01f;   // 60° apart
+        voroSeeds[i].py = i * 0.785f + random8() * 0.01f;   // 45° apart
     }
 }
 
@@ -370,12 +409,15 @@ void drawVoronoi(uint32_t now) {
     static uint32_t last = 0;
     if (!frameReady(now, last, 33)) return;
 
+    float T = voroTick * 0.0025f;   // one full orbit cycle ≈ 2500 frames ≈ 83 s
+    voroTick++;
+    voroBaseHue++;   // full colour-wheel cycle every 256 frames ≈ 8.5 s
+
+    // Pre-compute seed positions from Lissajous equations
+    float sx[VORONOI_SEEDS], sy[VORONOI_SEEDS];
     for (uint8_t i = 0; i < VORONOI_SEEDS; i++) {
-        voroSeeds[i].x += voroSeeds[i].vx;
-        voroSeeds[i].y += voroSeeds[i].vy;
-        if (voroSeeds[i].x < 1.0f || voroSeeds[i].x > MATRIX_W - 2.0f) voroSeeds[i].vx = -voroSeeds[i].vx;
-        if (voroSeeds[i].y < 1.0f || voroSeeds[i].y > MATRIX_H - 2.0f) voroSeeds[i].vy = -voroSeeds[i].vy;
-        voroSeeds[i].hue++;
+        sx[i] = voroSeeds[i].cx + voroSeeds[i].rx * sinf(T * voroSeeds[i].fx + voroSeeds[i].px);
+        sy[i] = voroSeeds[i].cy + voroSeeds[i].ry * sinf(T * voroSeeds[i].fy + voroSeeds[i].py);
     }
 
     for (uint8_t y = 0; y < MATRIX_H; y++) {
@@ -383,19 +425,17 @@ void drawVoronoi(uint32_t now) {
             float d1 = 1e9f, d2 = 1e9f;
             uint8_t nearest = 0;
             for (uint8_t i = 0; i < VORONOI_SEEDS; i++) {
-                float dx = x - voroSeeds[i].x;
-                float dy = y - voroSeeds[i].y;
+                float dx = x - sx[i], dy = y - sy[i];
                 float d  = sqrtf(dx*dx + dy*dy);
                 if (d < d1) { d2 = d1; d1 = d; nearest = i; }
                 else if (d < d2) { d2 = d; }
             }
+            // Hue: evenly spaced seeds + global drift
+            uint8_t hue = voroBaseHue + nearest * (256 / VORONOI_SEEDS);
             bool isEdge = (d2 - d1) < 1.5f;
-            if (isEdge) {
-                leds[XY(x, y)] = CHSV(voroSeeds[nearest].hue, 80, 255);
-            } else {
-                uint8_t bri = (uint8_t)constrain(200.0f - d1 * 8.0f, 60.0f, 200.0f);
-                leds[XY(x, y)] = CHSV(voroSeeds[nearest].hue, 210, bri);
-            }
+            leds[XY(x, y)] = isEdge
+                ? CHSV(hue, 60, 255)           // bright, near-white edge
+                : CHSV(hue, 220, 200);          // flat-bright cell interior
         }
     }
     FastLED.show();
@@ -470,23 +510,73 @@ void drawBoids(uint32_t now) {
     FastLED.show();
 }
 
-// 10. XOR Plasma ──────────────────────────────────────────────────
-// Bitwise XOR of coordinates with a time counter, plus two additive
-// sine waves, produces intricate geometric patterns that shift and
-// rotate cheaply.
-void drawXorPlasma(uint32_t now) {
+// 10. Mandelbrot zoomer ───────────────────────────────────────────
+// Slowly zooms into four classic locations on the Mandelbrot set,
+// cycling through them. Float arithmetic is fine down to scale ~5e-4
+// on Teensy 3.6's FPU; resets before precision degrades.
+
+#define MAND_MAX_ITER  48
+#define MAND_TARGETS   4
+
+static const float mandTgtR[MAND_TARGETS] = {-0.7436f,  0.2750f, -0.7269f, -1.7491f};
+static const float mandTgtI[MAND_TARGETS] = { 0.1319f,  0.0000f,  0.1889f,  0.0000f};
+
+static float   mandScale   = 2.5f;
+static float   mandCx      = -0.5f;
+static float   mandCy      =  0.0f;
+static uint8_t mandTarget  = 0;
+static uint8_t mandHue     = 0;
+
+void initMandelbrot() {
+    mandScale  = 2.5f;
+    mandCx     = -0.5f;
+    mandCy     =  0.0f;
+    mandTarget = 0;
+    mandHue    = 0;
+}
+
+void drawMandelbrot(uint32_t now) {
     static uint32_t last = 0;
-    static uint16_t t    = 0;
-    if (!frameReady(now, last, 40)) return;
-    for (uint8_t y = 0; y < MATRIX_H; y++)
-        for (uint8_t x = 0; x < MATRIX_W; x++) {
-            uint8_t v = (x ^ y ^ (uint8_t)(t >> 1))
-                      + sin8(x * 8 + t)
-                      + sin8(y * 8 - t);
-            leds[XY(x, y)] = CHSV(v, 255, 200);
+    if (!frameReady(now, last, 33)) return;
+
+    // Pan toward target and zoom in
+    mandCx    += (mandTgtR[mandTarget] - mandCx) * 0.005f;
+    mandCy    += (mandTgtI[mandTarget] - mandCy) * 0.005f;
+    mandScale *= 0.992f;
+    mandHue   += 2;
+
+    // Reset: move to next target and zoom out to full set
+    if (mandScale < 5e-4f) {
+        mandTarget = (mandTarget + 1) % MAND_TARGETS;
+        mandScale  = 2.5f;
+        mandCx     = -0.5f;
+        mandCy     =  0.0f;
+    }
+
+    float pixSize = mandScale / MATRIX_W;
+
+    for (uint8_t py = 0; py < MATRIX_H; py++) {
+        float ci = mandCy + (py - MATRIX_H * 0.5f) * pixSize;
+        for (uint8_t px = 0; px < MATRIX_W; px++) {
+            float cr = mandCx + (px - MATRIX_W * 0.5f) * pixSize;
+            float zr = 0.0f, zi = 0.0f;
+            uint8_t iter = 0;
+            while (zr*zr + zi*zi < 4.0f && iter < MAND_MAX_ITER) {
+                float tmp = zr*zr - zi*zi + cr;
+                zi = 2.0f * zr * zi + ci;
+                zr = tmp;
+                iter++;
+            }
+            if (iter == MAND_MAX_ITER) {
+                leds[XY(px, py)] = CRGB::Black;
+            } else {
+                uint8_t hue = (uint8_t)(iter * 5) + mandHue;
+                uint8_t bri = map(iter, 0, MAND_MAX_ITER - 1, 60, 255);
+                leds[XY(px, py)] = CHSV(hue, 230, bri);
+            }
         }
+    }
     FastLED.show();
-    t += 2;
 }
 
 // 11. Spectrum Bars ───────────────────────────────────────────────
@@ -617,7 +707,7 @@ const Anim anims[] = {
     { "life",      initGoL,              drawGoL,              140 },
     { "voronoi",   initVoronoi,          drawVoronoi,          33  },
     { "boids",     initBoids,            drawBoids,            40  },
-    { "xorplasma", nullptr,              drawXorPlasma,        40  },
+    { "mandelbrot", initMandelbrot,       drawMandelbrot,       33  },
     { "spectrum",  initSpectrum,         drawSpectrum,         30  },
     { "beatpulse", initBeatPulse,        drawBeatPulse,        25  },
 };

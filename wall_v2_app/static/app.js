@@ -128,7 +128,17 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     window.sensorsTabDeactivated?.();
     window.cameraTabDeactivated?.();
+  } else {
+    // Reconnect if the WS dropped while the app was backgrounded (common on iOS PWA)
+    if (!ws || ws.readyState !== WebSocket.OPEN)
+      connectWS();
   }
+});
+
+// iOS BFCache restore: page shown from the back-forward cache without a reload
+window.addEventListener("pageshow", e => {
+  if (e.persisted && (!ws || ws.readyState !== WebSocket.OPEN))
+    connectWS();
 });
 
 // Last-resort cleanup on page close (best-effort — not guaranteed on mobile)

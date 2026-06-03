@@ -141,7 +141,10 @@
   document.getElementById("tool-fill").addEventListener("click", () => setTool("fill"));
   document.getElementById("tool-clear").addEventListener("click", () => {
     pixels.fill(0); render();
-    window.wallSend?.({ type: "draw_clear" });
+    // In live mode push the all-zeros frame directly so it can't be raced by a
+    // pending rAF push.  Without live mode the serial pC command is sufficient.
+    if (livePush) schedulePush();
+    else window.wallSend?.({ type: "draw_clear" });
   });
 
   const colorPicker = document.getElementById("color-picker");
@@ -152,7 +155,17 @@
     drawColor = hexToRgb(colorPicker.value);
   }
   colorPicker.addEventListener("input", syncSwatch);
-  colorSwatch.addEventListener("click", () => colorPicker.click());
+
+  // iOS Safari won't open a color picker from a programmatic .click() call inside
+  // another click handler — it must be a direct user gesture.  Move the input
+  // inside the swatch and let it fill the space transparently so the tap goes
+  // straight to the input.
+  colorSwatch.style.position = 'relative';
+  Object.assign(colorPicker.style, {
+    position: 'absolute', top: '0', left: '0',
+    width: '100%', height: '100%', opacity: '0', cursor: 'pointer'
+  });
+  colorSwatch.appendChild(colorPicker);
   syncSwatch();
 
   document.getElementById("draw-live").addEventListener("change", e => { livePush = e.target.checked; });
