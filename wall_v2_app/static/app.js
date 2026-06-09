@@ -91,6 +91,7 @@ function handleMsg(msg) {
   } else if (msg.type === "status") {
     status = msg;
     applyStatus(msg);
+    window.videoApplyStatus?.(msg);
     // serial field is injected by the Python bridge
     setSerialDot(msg.serial !== false);
     if (msg.saved !== undefined) window.drawUpdateSaved?.(msg);
@@ -100,7 +101,14 @@ function handleMsg(msg) {
       pendingResume = false;
       if (msg.draw) send({ type: "request_frame" });
       send({ type: "list_drawings" });
+      send({ type: "list_videos" });
     }
+  } else if (msg.type === "videos") {
+    window.videoUpdateList?.(msg);
+  } else if (msg.type === "upload_progress") {
+    window.videoUploadProgress?.(msg);
+  } else if (msg.type === "video_uploaded") {
+    window.videoUploadAck?.(msg);
   } else if (msg.type === "frame_data") {
     window.drawLoadFrame?.(msg.frame);
   } else if (msg.type === "saved") {
@@ -176,6 +184,7 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
     document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b === btn));
     document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === `panel-${tab}`));
     if (tab === "draw") window.drawTabActivated?.();
+    if (tab === "videos") window.videosTabActivated?.();
   });
 });
 
@@ -222,3 +231,4 @@ connectWS();
 window.wallSend       = send;
 window.wallSendBinary = sendBinary;
 window.wallStatus     = () => status;
+window.wallBufferedAmount = () => (ws ? ws.bufferedAmount : 0);

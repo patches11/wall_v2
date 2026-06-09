@@ -37,12 +37,13 @@ if not exist cert.pem (
 :: ── Print the address your phone should use ───────
 for /f %%i in ('python -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect((\"8.8.8.8\",80)); print(s.getsockname()[0]); s.close()"') do set LOCAL_IP=%%i
 
-echo [INFO] Open on your phone:  https://%LOCAL_IP%:8000
+echo [INFO] Open on your phone:  https://%LOCAL_IP%
+echo [INFO] (plain http://%LOCAL_IP% redirects here automatically)
 echo [INFO] Press Ctrl+C to stop.
 echo.
 
-:: ── Start server ──────────────────────────────────
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --ssl-certfile cert.pem --ssl-keyfile key.pem
+:: ── Start server (HTTPS on 443, HTTP redirect on 80) ──
+python run.py
 
 echo.
 echo Server stopped.

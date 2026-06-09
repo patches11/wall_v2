@@ -32,8 +32,19 @@ STATIC_DIR  = Path(__file__).parent / "static"
 bridge = SerialBridge(SERIAL_PORT, BAUD_RATE)
 
 
+def _silence_connection_reset(loop, context):
+    # On Windows the Proactor event loop logs a noisy ERROR when a client
+    # (browser WebSocket) drops the connection abruptly — common during/after a
+    # streamed video upload.  The reset is benign; swallow it and defer
+    # everything else to the default handler.
+    if isinstance(context.get("exception"), ConnectionResetError):
+        return
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    asyncio.get_running_loop().set_exception_handler(_silence_connection_reset)
     bridge.connect()
     bridge.start(asyncio.get_event_loop())
     # Ask the Teensy for its current state on startup
@@ -104,9 +115,11 @@ _EVENT_TO_CMD: dict[str, str | None] = {
 
 async def _dispatch(ws: WebSocket, msg: str | bytes):
     """Handle one incoming WebSocket message from the browser."""
-    # ── Binary frame (1875 bytes of raw RGB) ─────────────────────────
+    # ── Binary frame (1875 bytes of raw RGB) or video-upload chunk ───
     if isinstance(msg, bytes):
-        if len(msg) == 1875:
+        if bridge.uploading:
+            await bridge.feed_video_chunk(msg)
+        elif len(msg) == 1875:
             await bridge.send_binary(b"F" + msg)
         return
 
@@ -180,6 +193,30 @@ async def _dispatch(ws: WebSocket, msg: str | bytes):
 
     elif mtype == "cycle_sound":
         await bridge.send_text("Z")
+
+    # ── Video clips (SD-stored .wv25) ────────────────────────────────
+    elif mtype == "upload_video_begin":
+        await bridge.begin_video_upload(str(data.get("name", "")), int(data.get("size", 0)))
+
+    elif mtype == "list_videos":
+        await bridge.send_text("vl")
+
+    elif mtype == "play_video":
+        name = data.get("name")
+        if name:
+            await bridge.send_text("vp:" + str(name).replace("\n", "").replace("\r", ""))
+        else:
+            await bridge.send_text("v")
+        await asyncio.sleep(0.1)
+        await bridge.query()
+
+    elif mtype == "delete_video":
+        await bridge.send_text("vd:" + str(data.get("name", "")).replace("\n", "").replace("\r", ""))
+
+    elif mtype == "video_mode":
+        await bridge.send_text("v" if bool(data.get("active")) else "vx")
+        await asyncio.sleep(0.1)
+        await bridge.query()
 
     elif mtype == "camera_palette":
         # Browser sampled 6 dominant colors; for now just acknowledge.

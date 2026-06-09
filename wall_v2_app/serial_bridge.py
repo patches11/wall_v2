@@ -33,12 +33,17 @@ class SerialBridge:
         self._status: dict = {}
         self._connected = False
         self._scroll_task: asyncio.Task | None = None
+        self._video_remaining = 0   # bytes left in the active video upload (0 = idle)
+        self._video_total = 0       # total size of the active upload (for logging)
+        self._video_sent = 0        # bytes handed to the serial queue so far
+        self._video_t0 = 0.0        # monotonic start time of the active upload
+        self._video_log_mark = 0    # next byte threshold to log progress at
 
     # ── Connection ────────────────────────────────────────────────────
 
     def connect(self) -> bool:
         try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
+            self._ser = serial.Serial(self.port, self.baud, timeout=0.1, write_timeout=10)
             self._connected = True
             log.info("Serial connected: %s @ %d", self.port, self.baud)
             return True
@@ -113,6 +118,10 @@ class SerialBridge:
             data = json.loads(line)
         except json.JSONDecodeError:
             return
+        # Video list / upload acks — forward as-is, don't touch cached status.
+        if data.get("type") in ("videos", "video_uploaded", "video_deleted"):
+            await self.broadcast(data)
+            return
         # Frame readback (base64) — forward without touching cached status.
         if "frame" in data:
             await self.broadcast({"type": "frame_data", "frame": data["frame"]})
@@ -132,7 +141,18 @@ class SerialBridge:
             data = await self._write_queue.get()
             if self._ser and self._connected:
                 try:
+                    t0 = time.monotonic()
                     await asyncio.to_thread(self._ser.write, data)
+                    dt = time.monotonic() - t0
+                    # A single chunk should flush in milliseconds; a multi-second
+                    # write means the Teensy stopped reading (busy on SD) — log it
+                    # so we can see exactly where an upload stalls.
+                    if dt > 0.5:
+                        log.warning("Slow serial write: %d bytes took %.1fs", len(data), dt)
+                except serial.SerialTimeoutException:
+                    log.error("Serial write timed out (%d bytes) — Teensy not draining USB; "
+                              "aborting upload", len(data))
+                    self._video_remaining = 0
                 except (serial.SerialException, OSError):
                     self._mark_disconnected()
 
@@ -153,6 +173,56 @@ class SerialBridge:
     async def query(self):
         """Ask the Teensy for a JSON status update."""
         await self.send_text("?")
+
+    # ── Video upload (browser → serial → SD) ──────────────────────────
+
+    async def begin_video_upload(self, name: str, size: int):
+        """Send the upload header; the raw .wv25 bytes follow as binary chunks."""
+        if not self._connected:
+            return
+        name = name.replace(",", "").replace("\n", "").replace("\r", "")
+        self._video_remaining = max(0, int(size))
+        self._video_total = self._video_remaining
+        self._video_sent = 0
+        self._video_t0 = time.monotonic()
+        self._video_log_mark = 0
+        log.info("Upload begin: %s (%d bytes)", name, self._video_total)
+        await self.send_text(f"u{name},{self._video_remaining}")
+
+    async def feed_video_chunk(self, data: bytes):
+        """Forward one chunk of an in-progress upload straight to the Teensy."""
+        if self._video_remaining <= 0:
+            return
+        # Backpressure: the serial link drains far slower than the browser can
+        # send.  Without this the whole file piles into _write_queue in RAM and
+        # the progress bar hits 100% long before the SD write finishes (looks
+        # like a hang).  Waiting here stalls the WS read, which pauses the
+        # browser, so progress tracks the real serial throughput and RAM stays
+        # bounded (~64 chunks ≈ 256 KB in flight).
+        while self._write_queue.qsize() > 64:
+            await asyncio.sleep(0.005)
+        await self.send_binary(data)
+        self._video_remaining = max(0, self._video_remaining - len(data))
+        self._video_sent += len(data)
+        # Log every ~2 MB so the console shows the live rate and the exact byte
+        # offset if/where an upload stalls.
+        if self._video_sent >= self._video_log_mark:
+            self._video_log_mark += 2 * 1024 * 1024
+            elapsed = max(1e-3, time.monotonic() - self._video_t0)
+            rate = self._video_sent / elapsed / 1024  # KB/s
+            log.info("Upload progress: %.1f/%.1f MB  %.0f KB/s  queue=%d",
+                     self._video_sent / 1048576, self._video_total / 1048576,
+                     rate, self._write_queue.qsize())
+            # Emit a liveness/progress message to the client.  The serial link is
+            # silent for the duration of a (multi-minute) upload, so without this
+            # the browser's heartbeat sees a stale socket and force-closes it,
+            # aborting the transfer.  This also drives an accurate progress bar.
+            await self.broadcast({"type": "upload_progress",
+                                  "sent": self._video_sent, "total": self._video_total})
+
+    @property
+    def uploading(self) -> bool:
+        return self._video_remaining > 0
 
     # ── WebSocket client registry ─────────────────────────────────────
 

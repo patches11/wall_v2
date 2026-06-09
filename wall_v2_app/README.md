@@ -21,7 +21,11 @@ Then double-click **`start.bat`** (or run it from PowerShell). It will:
 1. Create `.env` from the example if it doesn't exist and prompt you to set the COM port
 2. Generate `cert.pem` / `key.pem` automatically if they don't exist
 3. Print the `https://` address to open on your phone
-4. Start the server
+4. Start the server (HTTPS on **443**, plus an HTTP redirect on **80**)
+
+Because it uses the standard web ports, you connect by typing just the IP on
+your phone — `https://<your-ip>` with no `:port`. Even plain `http://<your-ip>`
+redirects to HTTPS automatically.
 
 On subsequent runs, double-clicking `start.bat` is all you need.
 
@@ -49,7 +53,8 @@ Open `.env` and edit:
 SERIAL_PORT=COM4      # Windows: check Device Manager → Ports (COM & LPT)
 BAUD_RATE=115200
 HOST=0.0.0.0
-PORT=8000
+HTTPS_PORT=443        # app over HTTPS
+HTTP_PORT=80          # redirects to HTTPS
 ```
 
 On Windows, the Teensy shows up as **USB Serial Device** in Device Manager under Ports. If you have multiple COM ports, unplug the Teensy, check the list, plug it back in, and see which port appears.
@@ -76,7 +81,7 @@ The certificate needs to be trusted by your phone's OS, not just accepted as a b
 Transfer `cert.pem` to your phone first. The easiest methods:
 - **Windows share**: put `cert.pem` in a shared folder and open it from your phone's file browser
 - **Email**: email it to yourself and open the attachment
-- **Serve it**: the running app serves it at `https://<your-ip>:8000/static/cert.pem` once the server is up (accept the browser warning once just to download the file)
+- **Serve it**: the running app serves it at `https://<your-ip>/static/cert.pem` once the server is up (accept the browser warning once just to download the file)
 
 **Android (Chrome)**
 
@@ -101,10 +106,17 @@ Both steps are required. Installing the profile (step 3) is not enough on its ow
 **3. Start the server with HTTPS**
 
 ```powershell
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --ssl-certfile cert.pem --ssl-keyfile key.pem
+python run.py
 ```
 
-Open `https://<your-ip>:8000` on your phone. Use `https://`, not `http://`.
+This serves HTTPS on port 443 and an HTTP→HTTPS redirect on port 80. Open
+`https://<your-ip>` on your phone (no port needed). Plain `http://<your-ip>`
+redirects to HTTPS automatically.
+
+> To run on a custom port instead (e.g. if 80/443 are taken on Windows), set
+> `HTTPS_PORT`/`HTTP_PORT` in `.env`, or run uvicorn directly:
+> `python -m uvicorn main:app --host 0.0.0.0 --port 8000 --ssl-certfile cert.pem --ssl-keyfile key.pem`
+> and open `https://<your-ip>:8000`.
 
 ---
 
@@ -127,7 +139,7 @@ Or: Chrome may show an install banner or an **install icon** (⊕) in the addres
 
 Chrome on iOS cannot install PWAs — use Safari.
 
-1. Open `https://<your-ip>:8000` in **Safari**
+1. Open `https://<your-ip>` in **Safari**
 2. Tap the **Share button** (box with arrow pointing up)
 3. Scroll down and tap **Add to Home Screen**
 4. Tap **Add**
@@ -271,7 +283,15 @@ python simulate.py clip.wv25 --brightness 180 --gamma 2.4 --scale 28
 Flags: `--loop`, `--scale` (px per LED), `--gap` (black gap between cells), `--brightness` (0–255), `--gamma`, `--fps` (override).
 Keys while playing: **space** pause/play · **`[`** / **`]`** step · **`+`** / **`-`** brightness · **`,`** / **`.`** gamma · **`q`** quit.
 
-> On-wall playback from the Teensy's SD card is not implemented yet — for now these tools produce and preview clips on the computer.
+**4. Play it on the wall** (Videos tab)
+
+Once a clip looks right in the simulator, upload it to the Teensy's SD card from the **Videos** tab in the app: tap **Choose a .wv25 file**, pick the clip, and watch the progress bar. Uploaded clips appear in the list with their size and the card's free space.
+
+- **Tap a clip** to play just that one, looped, on the wall.
+- **✕** (or hold) deletes a clip from the SD card.
+- The **Video mode** toggle in the Controls tab plays the whole `/video/` playlist — each clip in full, then the next, looping forever — and stays on video (no animation switching) until you turn it off or pick an animation.
+
+Clips are stored in `/video/` on the SD card; upload streams the raw `.wv25` bytes over the same USB serial link the rest of the app uses.
 
 ---
 

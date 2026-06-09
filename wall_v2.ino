@@ -119,6 +119,35 @@ unsigned long drawCycleStart = 0;
 int8_t        cycleIdx = -1;
 #define DRAW_CYCLE_MS 8000UL
 
+// ── Video mode (SD-stored .wv25 clips) ────────────────────────────
+// .wv25 = 12-byte header (magic "WV25", ver, w, h, fps, frame_count u32 LE)
+// then frame_count × 1875 bytes row-major RGB — exactly showBuf()'s layout.
+#define VIDEO_DIR    "/video"
+#define WV25_HEADER  12
+#define VID_NAME_MAX 40
+
+bool     videoMode      = false;   // sticky: playing clips, animations paused
+bool     videoSingle    = false;   // true = loop one named clip; false = cycle all
+bool     videoPlaying   = false;   // a clip is currently open and streaming
+File     videoFile;
+uint8_t  videoFps       = 24;
+uint32_t videoFrameCount = 0;
+uint32_t videoFrameIdx   = 0;
+uint32_t lastVideoMs     = 0;
+char     videoName[VID_NAME_MAX] = {0};
+
+// Upload receive (mirrors the binary-frame accumulator below)
+bool     videoRecv      = false;
+File     uploadFile;
+uint32_t uploadRemaining = 0;
+bool     uploadOk       = false;
+char     uploadName[VID_NAME_MAX] = {0};
+uint8_t  uploadBuf[4096];   // larger block = fewer SD writes = faster uploads
+uint16_t uploadBufPos   = 0;
+uint32_t uploadTotal    = 0;     // expected byte count for the active upload
+uint32_t lastUploadMs   = 0;     // millis() of the last byte received
+#define  UPLOAD_TIMEOUT_MS 15000UL  // give up if the stream stalls this long
+
 // ── Animations ────────────────────────────────────────────────────
 
 // 1. Plasma ──────────────────────────────────────────────────────
@@ -783,9 +812,12 @@ unsigned long animStart = 0;
 
 void selectAnim(uint8_t idx) {
     // Selecting an animation always returns to live-animation mode, so it
-    // overrides any active drawing or drawing-cycle.
+    // overrides any active drawing, drawing-cycle, or video playback.
     drawMode  = false;
     drawCycle = false;
+    videoMode    = false;
+    videoPlaying = false;
+    if (videoFile) videoFile.close();
     animIdx   = idx % NUM_ANIMS;
     animStart = millis();
     FastLED.clear();
@@ -911,11 +943,189 @@ void printSlots() {
     Serial.println(F("}"));
 }
 
+// ── Video helpers (SD-stored .wv25 clips) ──────────────────────────
+
+// Copy only filename-safe characters; drops '/' so no path traversal.
+void sanitizeName(const char* in, char* out, size_t outSize) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < outSize - 1; i++) {
+        char c = in[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')
+            out[j++] = c;
+    }
+    out[j] = 0;
+}
+
+// Open /video/<name>, validate the header, and prime playback state.
+bool openVideo(const char* name) {
+    if (!sdOk || !name || !name[0]) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "%s/%s", VIDEO_DIR, name);
+    if (videoFile) videoFile.close();
+    videoFile = SD.open(path, FILE_READ);
+    if (!videoFile) { videoPlaying = false; return false; }
+    uint8_t h[WV25_HEADER];
+    if (videoFile.read(h, WV25_HEADER) != WV25_HEADER ||
+        h[0] != 'W' || h[1] != 'V' || h[2] != '2' || h[3] != '5') {
+        videoFile.close(); videoPlaying = false; return false;
+    }
+    videoFps        = h[7] ? h[7] : 24;
+    videoFrameCount = (uint32_t)h[8] | ((uint32_t)h[9] << 8) |
+                      ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
+    videoFrameIdx = 0;
+    lastVideoMs   = 0;
+    strncpy(videoName, name, VID_NAME_MAX - 1);
+    videoName[VID_NAME_MAX - 1] = 0;
+    videoPlaying = (videoFrameCount > 0);
+    return videoPlaying;
+}
+
+// Open the clip after videoName in /video/, wrapping to the first.
+bool openNextVideo() {
+    if (!sdOk) return false;
+    File dir = SD.open(VIDEO_DIR);
+    if (!dir) return false;
+    char firstName[VID_NAME_MAX] = {0};
+    char nextName[VID_NAME_MAX]  = {0};
+    bool foundCurrent = false, haveNext = false;
+    File e;
+    while ((e = dir.openNextFile())) {
+        if (!e.isDirectory()) {
+            const char* nm = e.name();
+            if (firstName[0] == 0) { strncpy(firstName, nm, VID_NAME_MAX - 1); }
+            if (foundCurrent && !haveNext) { strncpy(nextName, nm, VID_NAME_MAX - 1); haveNext = true; }
+            if (strcmp(nm, videoName) == 0) foundCurrent = true;
+        }
+        e.close();
+    }
+    dir.close();
+    const char* target = haveNext ? nextName : firstName;
+    if (target[0] == 0) { videoPlaying = false; return false; }
+    return openVideo(target);
+}
+
+void enterVideoMode(bool single, const char* name) {
+    drawMode = false; drawCycle = false;
+    videoMode    = true;
+    videoSingle  = single;
+    videoPlaying = false;
+    FastLED.clear(); FastLED.show();
+    if (single && name) {
+        char nm[VID_NAME_MAX]; sanitizeName(name, nm, sizeof(nm));
+        openVideo(nm);
+    } else {
+        videoName[0] = 0;     // cycle: start from the first clip
+        openNextVideo();
+    }
+}
+
+// Stream the next due frame; advance/loop at end of clip.
+void videoStep(uint32_t now) {
+    if (!videoPlaying) {
+        if (videoSingle) { if (videoName[0]) openVideo(videoName); }
+        else             openNextVideo();
+        if (!videoPlaying) return;   // empty /video/ → idle, no crash
+    }
+    if (!frameReady(now, lastVideoMs, 1000 / max((uint8_t)1, videoFps))) return;
+
+    if (videoFrameIdx >= videoFrameCount) {           // reached end of clip
+        if (videoSingle) { videoFile.seek(WV25_HEADER); videoFrameIdx = 0; }
+        else if (!openNextVideo()) { videoPlaying = false; return; }
+    }
+    if (videoFile.read(frameBuf, GRID_LEDS * 3) != (int)(GRID_LEDS * 3)) {
+        // Short read / corrupt clip — restart it (single) or skip (cycle).
+        if (videoSingle) { videoFile.seek(WV25_HEADER); videoFrameIdx = 0; }
+        else openNextVideo();
+        return;
+    }
+    showBuf(frameBuf);
+    videoFrameIdx++;
+}
+
+// List /video/ contents + SD usage as JSON for the app.
+void printVideos() {
+    Serial.print(F("{\"type\":\"videos\",\"items\":["));
+    bool first = true;
+    if (sdOk) {
+        File dir = SD.open(VIDEO_DIR);
+        if (dir) {
+            File e;
+            while ((e = dir.openNextFile())) {
+                if (!e.isDirectory()) {
+                    if (!first) Serial.print(',');
+                    Serial.print(F("{\"name\":\"")); Serial.print(e.name());
+                    Serial.print(F("\",\"size\":")); Serial.print((uint32_t)e.size());
+                    Serial.print('}');
+                    first = false;
+                }
+                e.close();
+            }
+            dir.close();
+        }
+    }
+    // Whole-card usage so the app can show free space.
+    Serial.print(F("],\"used\":"));  Serial.print(sdOk ? (uint64_t)SD.usedSize()  : (uint64_t)0);
+    Serial.print(F(",\"total\":")); Serial.print(sdOk ? (uint64_t)SD.totalSize() : (uint64_t)0);
+    Serial.print(F(",\"sd\":"));    Serial.print(sdOk ? "true" : "false");
+    Serial.println(F("}"));
+}
+
+// Flush, close, and ack the in-progress upload (called on completion OR on a
+// stall timeout). Reports received-vs-expected bytes so the app can tell a
+// stalled/lossy transfer from a successful one; a short file is deleted.
+void finishUpload() {
+    if (uploadBufPos > 0) {
+        if (uploadFile && uploadFile.write(uploadBuf, uploadBufPos) != uploadBufPos) uploadOk = false;
+        uploadBufPos = 0;
+    }
+    if (uploadFile) uploadFile.close();
+    videoRecv = false;
+    uint32_t received = uploadTotal - uploadRemaining;
+    bool ok = uploadOk && (uploadRemaining == 0);
+    if (!ok && sdOk && uploadName[0]) {
+        char path[64];
+        snprintf(path, sizeof(path), "%s/%s", VIDEO_DIR, uploadName);
+        if (SD.exists(path)) SD.remove(path);
+    }
+    Serial.print(F("{\"type\":\"video_uploaded\",\"name\":\""));
+    Serial.print(uploadName);
+    Serial.print(F("\",\"ok\":"));     Serial.print(ok ? "true" : "false");
+    Serial.print(F(",\"received\":")); Serial.print(received);
+    Serial.print(F(",\"size\":"));     Serial.print(uploadTotal);
+    Serial.println(F("}"));
+    printVideos();
+}
+
 // ── USB serial command handler ─────────────────────────────────────
 // 9600 baud, newline-terminated. Commands: n p b+ b- s+ s- c ?
 // Connect via Arduino Serial Monitor or any terminal.
 
 void handleSerial() {
+    // ── Video upload accumulation ─────────────────────────────────
+    // After a `u<name>,<size>` command, drain the raw .wv25 bytes that
+    // follow into the open SD file (buffered), then ack.
+    if (videoRecv) {
+        bool got = false;
+        while (Serial.available() && uploadRemaining > 0) {
+            uploadBuf[uploadBufPos++] = (uint8_t)Serial.read();
+            uploadRemaining--;
+            got = true;
+            if (uploadBufPos >= sizeof(uploadBuf)) {
+                if (uploadFile && uploadFile.write(uploadBuf, uploadBufPos) != uploadBufPos) uploadOk = false;
+                uploadBufPos = 0;
+            }
+        }
+        if (got) lastUploadMs = millis();
+        if (uploadRemaining == 0) {
+            finishUpload();                                  // got every byte
+        } else if (millis() - lastUploadMs > UPLOAD_TIMEOUT_MS) {
+            uploadOk = false;                                // stream stalled
+            finishUpload();
+        }
+        return;
+    }
+
     // ── Binary frame accumulation ─────────────────────────────────
     // If a frame receive is in progress, drain available bytes first.
     if (frameRecv) {
@@ -1006,6 +1216,52 @@ void handleSerial() {
                 speedScale = (uint8_t)constrain(buf.substring(1).toInt(), 1, 255);
             }
 
+            // ── Video upload / list / delete / playback ───────────
+            // u<name>,<size> begins an upload: open the SD file, then the
+            // raw bytes that follow are drained at the top of handleSerial.
+            else if (buf[0] == 'u' && buf.length() > 1) {
+                int comma = buf.indexOf(',');
+                if (comma > 1) {
+                    // Release any open playback handle so the upload write has
+                    // exclusive SD access (a concurrent read/enumerate corrupts it).
+                    videoPlaying = false;
+                    if (videoFile) videoFile.close();
+                    sanitizeName(buf.substring(1, comma).c_str(), uploadName, sizeof(uploadName));
+                    uploadRemaining = (uint32_t)strtoul(buf.substring(comma + 1).c_str(), nullptr, 10);
+                    uploadTotal  = uploadRemaining;
+                    lastUploadMs = millis();
+                    uploadBufPos = 0;
+                    uploadOk     = true;
+                    if (sdOk && uploadName[0] && uploadRemaining > 0) {
+                        if (!SD.exists(VIDEO_DIR)) SD.mkdir(VIDEO_DIR);
+                        char path[64];
+                        snprintf(path, sizeof(path), "%s/%s", VIDEO_DIR, uploadName);
+                        if (SD.exists(path)) SD.remove(path);
+                        uploadFile = SD.open(path, FILE_WRITE);
+                        if (!uploadFile) uploadOk = false;
+                    } else {
+                        uploadOk = false;
+                    }
+                    videoRecv = true;
+                    buf = "";
+                    return;   // next handleSerial call drains the upload bytes
+                }
+            }
+            else if (buf == "vl") { printVideos(); }
+            else if (buf == "vx") { selectAnim(animIdx); }          // exit video mode
+            else if (buf.startsWith("vd:") && buf.length() > 3) {
+                char nm[VID_NAME_MAX]; sanitizeName(buf.substring(3).c_str(), nm, sizeof(nm));
+                if (sdOk && nm[0]) {
+                    char path[64]; snprintf(path, sizeof(path), "%s/%s", VIDEO_DIR, nm);
+                    if (SD.exists(path)) SD.remove(path);
+                }
+                printVideos();
+            }
+            else if (buf.startsWith("vp:") && buf.length() > 3) {
+                enterVideoMode(true, buf.substring(3).c_str());     // play one clip, looped
+            }
+            else if (buf == "v") { enterVideoMode(false, nullptr); } // cycle all clips
+
             // ── Status — JSON for easy Python parsing ─────────────
             else if (buf == "?") {
                 Serial.print(F("{\"anim\":"));     Serial.print(animIdx);
@@ -1017,6 +1273,8 @@ void handleSerial() {
                 Serial.print(F(",\"draw\":"));     Serial.print(drawMode  ? "true" : "false");
                 Serial.print(F(",\"drawcycle\":")); Serial.print(drawCycle ? "true" : "false");
                 Serial.print(F(",\"sd\":"));       Serial.print(sdOk ? "true" : "false");
+                Serial.print(F(",\"video\":"));    Serial.print(videoMode ? "true" : "false");
+                Serial.print(F(",\"videoname\":\"")); Serial.print(videoName); Serial.print('"');
                 Serial.print(F(",\"anims\":["));
                 for (uint8_t i = 0; i < NUM_ANIMS; i++) {
                     Serial.print('"'); Serial.print(anims[i].name); Serial.print('"');
@@ -1093,6 +1351,12 @@ void setup() {
 
 void loop() {
     uint32_t now = millis();
+    // During an upload, spin fast: drain serial straight to SD and skip all
+    // rendering so the transfer isn't throttled by FastLED.show()/animation work.
+    if (videoRecv) {
+        handleSerial();
+        return;
+    }
     if (drawCycle) {
         // Rotate through the occupied saved-drawing slots.
         if (now - drawCycleStart >= DRAW_CYCLE_MS) {
@@ -1102,6 +1366,11 @@ void loop() {
                 if (slotOccupied(cycleIdx)) { loadSlot(cycleIdx); showBuf(frameBuf); break; }
             }
         }
+    } else if (videoMode && !drawMode && !videoRecv) {
+        // Sticky video mode: play SD clips; never auto-switch to animations.
+        // Suspended during an upload (videoRecv) so playback SD reads don't
+        // collide with the upload's open write handle.
+        videoStep(now);
     } else if (!drawMode) {
         if (autoCycle && now - animStart >= ANIM_DURATION_MS)
             advanceCycle();
