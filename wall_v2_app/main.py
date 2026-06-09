@@ -118,7 +118,11 @@ async def _dispatch(ws: WebSocket, msg: str | bytes):
 
     mtype = data.get("type")
 
-    if mtype == "query":
+    if mtype == "ping":
+        # App-level heartbeat so the client can detect a half-open socket.
+        await ws.send_text(json.dumps({"type": "pong"}))
+
+    elif mtype == "query":
         await bridge.query()
         await asyncio.sleep(0.15)
         await bridge.broadcast({"type": "status", **bridge.status})
@@ -154,6 +158,28 @@ async def _dispatch(ws: WebSocket, msg: str | bytes):
 
     elif mtype == "draw_clear":
         await bridge.send_text("pC")
+
+    # ── Drawing resume / save / load / cycle ─────────────────────────
+    elif mtype == "request_frame":
+        await bridge.send_text("g")
+
+    elif mtype == "save_drawing":
+        await bridge.send_text(f"W{int(data['slot'])}")
+
+    elif mtype == "load_drawing":
+        await bridge.send_text(f"R{int(data['slot'])}")
+
+    elif mtype == "delete_drawing":
+        await bridge.send_text(f"X{int(data['slot'])}")
+
+    elif mtype == "list_drawings":
+        await bridge.send_text("L")
+
+    elif mtype == "cycle_drawings":
+        await bridge.send_text("Y")
+
+    elif mtype == "cycle_sound":
+        await bridge.send_text("Z")
 
     elif mtype == "camera_palette":
         # Browser sampled 6 dominant colors; for now just acknowledge.

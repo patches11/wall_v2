@@ -17,7 +17,6 @@
   let tool      = "paint";
   let drawColor = hexToRgb("#ff2255");
   let isDown    = false;
-  let livePush  = false;
   let pendingPush = false;
 
   // ── Helpers ──────────────────────────────────────────────────────────
@@ -66,7 +65,7 @@
     if (tool === "paint") setPixel(x, y, ...drawColor);
     else if (tool === "erase") setPixel(x, y, 0, 0, 0);
     render();
-    if (livePush) schedulePush();
+    schedulePush();
   }
 
   function floodFill(sx, sy, [tr, tg, tb]) {
@@ -82,7 +81,7 @@
       stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
     }
     render();
-    if (livePush) schedulePush();
+    schedulePush();
   }
 
   function pushFrame() {
@@ -141,10 +140,7 @@
   document.getElementById("tool-fill").addEventListener("click", () => setTool("fill"));
   document.getElementById("tool-clear").addEventListener("click", () => {
     pixels.fill(0); render();
-    // In live mode push the all-zeros frame directly so it can't be raced by a
-    // pending rAF push.  Without live mode the serial pC command is sufficient.
-    if (livePush) schedulePush();
-    else window.wallSend?.({ type: "draw_clear" });
+    schedulePush();
   });
 
   const colorPicker = document.getElementById("color-picker");
@@ -168,7 +164,6 @@
   colorSwatch.appendChild(colorPicker);
   syncSwatch();
 
-  document.getElementById("draw-live").addEventListener("change", e => { livePush = e.target.checked; });
   document.getElementById("draw-push-btn").addEventListener("click", () => {
     window.wallSend?.({ type: "draw_mode", active: true });
     pushFrame();
@@ -176,6 +171,56 @@
 
   // Enter draw mode when tab is activated (no-op if already in draw mode)
   window.drawTabActivated = () => window.wallSend?.({ type: "draw_mode", active: true });
+
+  // ── Resume: load a base64 frame pulled back from the wall ──────────────
+  window.drawLoadFrame = (b64) => {
+    try {
+      const bin = atob(b64);
+      const n = Math.min(bin.length, pixels.length);
+      for (let i = 0; i < n; i++) pixels[i] = bin.charCodeAt(i);
+      render();
+    } catch (e) { console.error("drawLoadFrame failed", e); }
+  };
+
+  // ── Saved drawings (SD or RAM on the Teensy) ───────────────────────────
+  const slotGrid   = document.getElementById("slot-grid");
+  const slotHint   = document.getElementById("slot-hint");
+  const cycleToggle = document.getElementById("draw-cycle-toggle");
+
+  cycleToggle.addEventListener("change", () => window.wallSend?.({ type: "cycle_drawings" }));
+
+  let lastSaved = [];
+  let totalSlots = 8;
+
+  window.drawUpdateSaved = (msg) => {
+    if (Array.isArray(msg.saved)) lastSaved = msg.saved;
+    if (typeof msg.slots === "number") totalSlots = msg.slots;
+    if (msg.drawcycle !== undefined) cycleToggle.checked = !!msg.drawcycle;
+    if (msg.sd !== undefined) slotHint.textContent = msg.sd ? "Stored on SD card" : "Stored in RAM (lost on power-off)";
+    buildSlots();
+  };
+
+  function buildSlots() {
+    slotGrid.innerHTML = "";
+    for (let i = 0; i < totalSlots; i++) {
+      const filled = lastSaved.includes(i);
+      const btn = document.createElement("button");
+      btn.className = "slot-btn" + (filled ? " filled" : "");
+      btn.textContent = i + 1;
+      if (filled) {
+        // tap → load; long-press → delete
+        let lp, longFired = false;
+        btn.addEventListener("pointerdown", () => { longFired = false; lp = setTimeout(() => { longFired = true; window.wallSend?.({ type: "delete_drawing", slot: i }); }, 700); });
+        ["pointerup","pointerleave","pointercancel"].forEach(ev => btn.addEventListener(ev, () => clearTimeout(lp)));
+        btn.addEventListener("click", () => { if (!longFired) window.wallSend?.({ type: "load_drawing", slot: i }); });
+      } else {
+        // empty slot → save the current drawing here
+        btn.addEventListener("click", () => window.wallSend?.({ type: "save_drawing", slot: i }));
+      }
+      slotGrid.appendChild(btn);
+    }
+  }
+  buildSlots();
 
   // Initial render
   render();

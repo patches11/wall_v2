@@ -3,3 +3,6 @@ uvicorn[standard]>=0.29.0
 pyserial>=3.5
 python-dotenv>=1.0.0
 websockets>=12.0
+# video/ utilities (convert.py + simulate.py); ffmpeg is a separate system binary
+numpy>=1.23
+opencv-python>=4.6

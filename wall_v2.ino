@@ -8,6 +8,7 @@
 #include <Audio.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <SD.h>
 
 // ── Grid ──────────────────────────────────────────────────────────
 #define MATRIX_W       25
@@ -23,6 +24,7 @@ CRGB leds[NUM_LEDS];
 uint8_t  brightness = 128;   // 0–255
 uint8_t  speedScale = 128;   // 128 = 1×; 64 = 0.5×; 255 ≈ 2×
 bool     autoCycle  = true;
+bool     cycleSound = false;  // include mic-reactive anims in auto-cycle?
 
 // ── Encoder & button ──────────────────────────────────────────────
 // Encoder library (bundled with Teensyduino) uses hardware interrupts
@@ -105,7 +107,17 @@ static uint8_t  specPeakTimer[MATRIX_W];  // frames until peak starts falling
 bool     drawMode  = false;
 bool     frameRecv = false;    // true while accumulating a binary 'F' frame
 uint16_t framePos  = 0;
-uint8_t  frameBuf[GRID_LEDS * 3];  // 1875 bytes; row-major RGB
+uint8_t  frameBuf[GRID_LEDS * 3];  // 1875 bytes; row-major RGB — last pushed image
+
+// ── Saved drawings (SD if present, else RAM) ──────────────────────
+#define NUM_SLOTS 8
+bool          sdOk = false;
+uint8_t       ramSlots[NUM_SLOTS][GRID_LEDS * 3];
+bool          ramOccupied[NUM_SLOTS] = { false };
+bool          drawCycle = false;          // cycle through saved drawings
+unsigned long drawCycleStart = 0;
+int8_t        cycleIdx = -1;
+#define DRAW_CYCLE_MS 8000UL
 
 // ── Animations ────────────────────────────────────────────────────
 
@@ -172,19 +184,43 @@ void drawTwinkle(uint32_t now) {
 // 4. Fire ────────────────────────────────────────────────────────
 // Heat rises from the bottom; aggressive cooling creates a steep
 // gradient: yellow-white at the base, red mid-way, dark at the top.
-void initFire() { memset(heat, 0, sizeof(heat)); }
+// Custom fire palette: black → maroon → red → orange → yellow. Tops out at a
+// warm yellow (never white) so the hot base reads as flame, not a burn-out.
+static CRGBPalette16 firePal;
+static uint16_t      fireTick = 0;
+
+void initFire() {
+    memset(heat, 0, sizeof(heat));
+    firePal = CRGBPalette16(
+        CRGB(  0,  0,  0), CRGB( 24,  0,  0), CRGB( 56,  0,  0), CRGB( 96,  4,  0),
+        CRGB(130, 12,  0), CRGB(165, 28,  0), CRGB(195, 44,  0), CRGB(215, 60,  0),
+        CRGB(230, 80,  0), CRGB(240,105,  0), CRGB(248,130, 10), CRGB(252,160, 20),
+        CRGB(255,185, 35), CRGB(255,205, 60), CRGB(255,220, 90), CRGB(255,235,130)
+    );
+}
 
 void drawFire(uint32_t now) {
     static uint32_t last = 0;
     if (!frameReady(now, last, 25)) return;
+    fireTick++;
 
     // Vertical: cool, drift upward, stoke base
     for (uint8_t x = 0; x < MATRIX_W; x++) {
+        // Per-column cooling drawn from noise → columns flicker independently.
+        // Low cooling so heat survives further up the column → taller flames.
+        uint8_t cool = 3 + (inoise8(x * 60, fireTick * 11) >> 5);
         for (uint8_t y = 0; y < MATRIX_H; y++)
-            heat[x][y] = qsub8(heat[x][y], random8(5, 15));
+            heat[x][y] = qsub8(heat[x][y], random8(cool, cool + 4));
         for (uint8_t y = MATRIX_H - 1; y >= 2; y--)
             heat[x][y] = (heat[x][y-1] + heat[x][y-2] + heat[x][y-2]) / 3;
-        heat[x][0] = qadd8(heat[x][0], random8(80, 180));
+        // Spatially-coherent, time-varying ember base so columns differ in
+        // height; capped below white. Rare sparks flare a column brighter.
+        // A gentle second-row seed gives flames a little extra reach.
+        uint8_t ember = inoise8(x * 50, fireTick * 20);
+        uint8_t base  = 108 + (ember >> 1);             // ~108..235
+        if (random8() < 18) base = qadd8(base, random8(20, 50));
+        heat[x][0] = base;
+        heat[x][1] = qsub8(base, random8(45, 75));
     }
 
     // Horizontal: blend each row with its neighbours so columns
@@ -201,7 +237,7 @@ void drawFire(uint32_t now) {
 
     for (uint8_t x = 0; x < MATRIX_W; x++)
         for (uint8_t y = 0; y < MATRIX_H; y++)
-            leds[XY(x, MATRIX_H - 1 - y)] = HeatColor(heat[x][y]);
+            leds[XY(x, MATRIX_H - 1 - y)] = ColorFromPalette(firePal, heat[x][y]);
     FastLED.show();
 }
 
@@ -261,20 +297,27 @@ void drawWaveInterference(uint32_t now) {
 
 #define RD_DA           1.0f
 #define RD_DB           0.5f
-#define RD_F            0.054f
-#define RD_K            0.063f
-#define RD_STEPS_FRAME  20
+#define RD_F            0.055f
+#define RD_K            0.062f
+#define RD_STEPS_FRAME  80
 
 void rdStep() {
+    // Canonical Gray-Scott weighted Laplacian (centre −1, orthogonal 0.2,
+    // diagonal 0.05). Its small eigenvalue magnitude keeps explicit Euler
+    // stable at Da=1.0; the plain 5-point stencil would blow up and clamp flat.
     for (uint8_t x = 0; x < MATRIX_W; x++) {
         uint8_t xL = (x == 0)          ? MATRIX_W - 1 : x - 1;
         uint8_t xR = (x == MATRIX_W-1) ? 0            : x + 1;
         for (uint8_t y = 0; y < MATRIX_H; y++) {
             uint8_t yU = (y == 0)          ? MATRIX_H - 1 : y - 1;
             uint8_t yD = (y == MATRIX_H-1) ? 0            : y + 1;
-            float a    = rdA[x][y], b = rdB[x][y];
-            float lapA = rdA[xL][y] + rdA[xR][y] + rdA[x][yU] + rdA[x][yD] - 4*a;
-            float lapB = rdB[xL][y] + rdB[xR][y] + rdB[x][yU] + rdB[x][yD] - 4*b;
+            float a = rdA[x][y], b = rdB[x][y];
+            float lapA = -a
+                + 0.2f  * (rdA[xL][y] + rdA[xR][y] + rdA[x][yU] + rdA[x][yD])
+                + 0.05f * (rdA[xL][yU] + rdA[xR][yU] + rdA[xL][yD] + rdA[xR][yD]);
+            float lapB = -b
+                + 0.2f  * (rdB[xL][y] + rdB[xR][y] + rdB[x][yU] + rdB[x][yD])
+                + 0.05f * (rdB[xL][yU] + rdB[xR][yU] + rdB[xL][yD] + rdB[xR][yD]);
             float ab2  = a * b * b;
             rdA2[x][y] = constrain(a + RD_DA*lapA - ab2 + RD_F*(1.0f-a), 0.0f, 1.0f);
             rdB2[x][y] = constrain(b + RD_DB*lapB + ab2 - (RD_F+RD_K)*b, 0.0f, 1.0f);
@@ -432,10 +475,15 @@ void drawVoronoi(uint32_t now) {
             }
             // Hue: evenly spaced seeds + global drift
             uint8_t hue = voroBaseHue + nearest * (256 / VORONOI_SEEDS);
-            bool isEdge = (d2 - d1) < 1.5f;
-            leds[XY(x, y)] = isEdge
-                ? CHSV(hue, 60, 255)           // bright, near-white edge
-                : CHSV(hue, 220, 200);          // flat-bright cell interior
+            // Stained-glass look: full-saturation cells that brighten toward
+            // their seed, separated by a thin dark seam (no white halo).
+            bool isEdge = (d2 - d1) < 1.2f;
+            if (isEdge) {
+                leds[XY(x, y)] = CHSV(hue, 255, 25);    // dark leaded seam
+            } else {
+                uint8_t bri = (d1 > 11.0f) ? 110 : (uint8_t)(255 - d1 * 13.0f);
+                leds[XY(x, y)] = CHSV(hue, 255, bri);
+            }
         }
     }
     FastLED.show();
@@ -539,9 +587,10 @@ void drawMandelbrot(uint32_t now) {
     static uint32_t last = 0;
     if (!frameReady(now, last, 33)) return;
 
-    // Pan toward target and zoom in
-    mandCx    += (mandTgtR[mandTarget] - mandCx) * 0.005f;
-    mandCy    += (mandTgtI[mandTarget] - mandCy) * 0.005f;
+    // Pan toward target faster than we zoom, so the boundary (where all the
+    // detail lives) stays centred instead of us plunging into a solid interior.
+    mandCx    += (mandTgtR[mandTarget] - mandCx) * 0.04f;
+    mandCy    += (mandTgtI[mandTarget] - mandCy) * 0.04f;
     mandScale *= 0.992f;
     mandHue   += 2;
 
@@ -553,25 +602,34 @@ void drawMandelbrot(uint32_t now) {
         mandCy     =  0.0f;
     }
 
-    float pixSize = mandScale / MATRIX_W;
+    // Add iterations as we zoom in so detail keeps filling the frame instead
+    // of collapsing into one flat black blob.
+    float   depth   = log2f(2.5f / mandScale);          // 0 at full view
+    uint8_t maxIter = (uint8_t)constrain(48 + 9 * depth, 48, 200);
+    float   pixSize = mandScale / MATRIX_W;
 
     for (uint8_t py = 0; py < MATRIX_H; py++) {
         float ci = mandCy + (py - MATRIX_H * 0.5f) * pixSize;
         for (uint8_t px = 0; px < MATRIX_W; px++) {
             float cr = mandCx + (px - MATRIX_W * 0.5f) * pixSize;
-            float zr = 0.0f, zi = 0.0f;
-            uint8_t iter = 0;
-            while (zr*zr + zi*zi < 4.0f && iter < MAND_MAX_ITER) {
+            float zr = 0.0f, zi = 0.0f, mag2 = 0.0f;
+            uint16_t iter = 0;
+            // Bailout radius 256 (not 4) makes the smooth-iteration estimate clean.
+            while ((mag2 = zr*zr + zi*zi) < 256.0f && iter < maxIter) {
                 float tmp = zr*zr - zi*zi + cr;
                 zi = 2.0f * zr * zi + ci;
                 zr = tmp;
                 iter++;
             }
-            if (iter == MAND_MAX_ITER) {
-                leds[XY(px, py)] = CRGB::Black;
+            if (iter >= maxIter) {
+                // Interior: a faint, slowly shifting indigo instead of dead
+                // black, so deep zooms never read as empty voids.
+                leds[XY(px, py)] = CHSV(160 + (mandHue >> 2), 200, 10);
             } else {
-                uint8_t hue = (uint8_t)(iter * 5) + mandHue;
-                uint8_t bri = map(iter, 0, MAND_MAX_ITER - 1, 60, 255);
+                // Continuous (smooth) escape time removes the chunky bands.
+                float smooth = iter + 1.0f - log2f(0.5f * log2f(mag2));
+                uint8_t hue = (uint8_t)(smooth * 10.0f) + mandHue;
+                uint8_t bri = 80 + (uint8_t)(sin8((uint8_t)(smooth * 14.0f)) >> 1);
                 leds[XY(px, py)] = CHSV(hue, 230, bri);
             }
         }
@@ -695,21 +753,22 @@ struct Anim {
     void (*init)();
     void (*draw)(uint32_t now);
     uint16_t frameMs;  // base frame interval at speedScale=128
+    bool     sound;    // true = mic/FFT-reactive; excluded from auto-cycle by default
 };
 
 const Anim anims[] = {
-    { "plasma",    nullptr,              drawPlasma,           18  },
-    { "ripple",    nullptr,              drawRipple,           20  },
-    { "twinkle",   nullptr,              drawTwinkle,          35  },
-    { "fire",      initFire,             drawFire,             25  },
-    { "waves",     initWaveInterference, drawWaveInterference, 22  },
-    { "reaction",  initRD,               drawRD,               33  },
-    { "life",      initGoL,              drawGoL,              140 },
-    { "voronoi",   initVoronoi,          drawVoronoi,          33  },
-    { "boids",     initBoids,            drawBoids,            40  },
-    { "mandelbrot", initMandelbrot,       drawMandelbrot,       33  },
-    { "spectrum",  initSpectrum,         drawSpectrum,         30  },
-    { "beatpulse", initBeatPulse,        drawBeatPulse,        25  },
+    { "plasma",    nullptr,              drawPlasma,           18,  false },
+    { "ripple",    nullptr,              drawRipple,           20,  false },
+    { "twinkle",   nullptr,              drawTwinkle,          35,  false },
+    { "fire",      initFire,             drawFire,             25,  false },
+    { "waves",     initWaveInterference, drawWaveInterference, 22,  false },
+    { "reaction",  initRD,               drawRD,               33,  false },
+    { "life",      initGoL,              drawGoL,              140, false },
+    { "voronoi",   initVoronoi,          drawVoronoi,          33,  false },
+    { "boids",     initBoids,            drawBoids,            40,  false },
+    { "mandelbrot", initMandelbrot,       drawMandelbrot,       33,  false },
+    { "spectrum",  initSpectrum,         drawSpectrum,         30,  true  },
+    { "beatpulse", initBeatPulse,        drawBeatPulse,        25,  true  },
 };
 const uint8_t NUM_ANIMS = sizeof(anims) / sizeof(anims[0]);
 
@@ -723,11 +782,27 @@ unsigned long animStart = 0;
 // handleSerial() (USB). Audio events will hook in here in Phase 4.
 
 void selectAnim(uint8_t idx) {
+    // Selecting an animation always returns to live-animation mode, so it
+    // overrides any active drawing or drawing-cycle.
+    drawMode  = false;
+    drawCycle = false;
     animIdx   = idx % NUM_ANIMS;
     animStart = millis();
     FastLED.clear();
     FastLED.show();
     if (anims[animIdx].init) anims[animIdx].init();
+}
+
+// Auto-cycle advance: step to the next anim, skipping mic-reactive ones unless
+// cycleSound is enabled (no mic wired up by default). Falls back to a plain
+// step if every other anim is sound-reactive.
+void advanceCycle() {
+    uint8_t next = animIdx;
+    for (uint8_t step = 0; step < NUM_ANIMS; step++) {
+        next = (next + 1) % NUM_ANIMS;
+        if (cycleSound || !anims[next].sound) break;
+    }
+    selectAnim(next);
 }
 
 void handleEvent(InputEvent e) {
@@ -740,6 +815,100 @@ void handleEvent(InputEvent e) {
         case SPEED_DOWN:   speedScale = max((uint8_t)16, qsub8(speedScale, 32)); break;
         case TOGGLE_CYCLE: autoCycle  = !autoCycle; break;
     }
+}
+
+// ── Draw-buffer / slot helpers ─────────────────────────────────────
+
+// Read the live grid back into a 1875-byte row-major RGB buffer.
+void captureGrid(uint8_t* dst) {
+    for (uint16_t i = 0; i < GRID_LEDS; i++) {
+        CRGB c = leds[XY(i % MATRIX_W, i / MATRIX_W)];
+        dst[i*3] = c.r; dst[i*3+1] = c.g; dst[i*3+2] = c.b;
+    }
+}
+
+// Paint a 1875-byte RGB buffer onto the grid and show it.
+void showBuf(const uint8_t* src) {
+    for (uint16_t i = 0; i < GRID_LEDS; i++)
+        leds[XY(i % MATRIX_W, i / MATRIX_W)] =
+            CRGB(src[i*3], src[i*3+1], src[i*3+2]);
+    FastLED.show();
+}
+
+// Stream raw bytes to Serial as base64 (keeps the host's line parser intact).
+void printBase64(const uint8_t* data, uint16_t len) {
+    static const char B64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint16_t i = 0;
+    for (; i + 2 < len; i += 3) {
+        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i+1] << 8) | data[i+2];
+        Serial.write(B64[(n >> 18) & 63]); Serial.write(B64[(n >> 12) & 63]);
+        Serial.write(B64[(n >> 6) & 63]);  Serial.write(B64[n & 63]);
+    }
+    uint16_t rem = len - i;
+    if (rem == 1) {
+        uint32_t n = (uint32_t)data[i] << 16;
+        Serial.write(B64[(n >> 18) & 63]); Serial.write(B64[(n >> 12) & 63]);
+        Serial.write('='); Serial.write('=');
+    } else if (rem == 2) {
+        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i+1] << 8);
+        Serial.write(B64[(n >> 18) & 63]); Serial.write(B64[(n >> 12) & 63]);
+        Serial.write(B64[(n >> 6) & 63]);  Serial.write('=');
+    }
+}
+
+bool slotOccupied(uint8_t n) {
+    if (n >= NUM_SLOTS) return false;
+    if (sdOk) { char p[24]; sprintf(p, "/wall/s%02u.bin", (unsigned)n); return SD.exists(p); }
+    return ramOccupied[n];
+}
+
+void saveSlot(uint8_t n) {
+    if (n >= NUM_SLOTS) return;
+    captureGrid(frameBuf);
+    if (sdOk) {
+        if (!SD.exists("/wall")) SD.mkdir("/wall");
+        char p[24]; sprintf(p, "/wall/s%02u.bin", (unsigned)n);
+        if (SD.exists(p)) SD.remove(p);
+        File f = SD.open(p, FILE_WRITE);
+        if (f) { f.write(frameBuf, GRID_LEDS * 3); f.close(); }
+    } else {
+        memcpy(ramSlots[n], frameBuf, GRID_LEDS * 3);
+        ramOccupied[n] = true;
+    }
+}
+
+bool loadSlot(uint8_t n) {
+    if (n >= NUM_SLOTS) return false;
+    if (sdOk) {
+        char p[24]; sprintf(p, "/wall/s%02u.bin", (unsigned)n);
+        File f = SD.open(p, FILE_READ);
+        if (!f) return false;
+        f.read(frameBuf, GRID_LEDS * 3);
+        f.close();
+    } else {
+        if (!ramOccupied[n]) return false;
+        memcpy(frameBuf, ramSlots[n], GRID_LEDS * 3);
+    }
+    return true;
+}
+
+void deleteSlot(uint8_t n) {
+    if (n >= NUM_SLOTS) return;
+    if (sdOk) { char p[24]; sprintf(p, "/wall/s%02u.bin", (unsigned)n); if (SD.exists(p)) SD.remove(p); }
+    else ramOccupied[n] = false;
+}
+
+void printSlots() {
+    Serial.print(F("{\"saved\":["));
+    bool first = true;
+    for (uint8_t i = 0; i < NUM_SLOTS; i++) {
+        if (slotOccupied(i)) { if (!first) Serial.print(','); Serial.print(i); first = false; }
+    }
+    Serial.print(F("],\"slots\":"));     Serial.print(NUM_SLOTS);
+    Serial.print(F(",\"drawcycle\":"));  Serial.print(drawCycle ? "true" : "false");
+    Serial.print(F(",\"sd\":"));         Serial.print(sdOk ? "true" : "false");
+    Serial.println(F("}"));
 }
 
 // ── USB serial command handler ─────────────────────────────────────
@@ -788,12 +957,37 @@ void handleSerial() {
             else if (buf == "s+") handleEvent(SPEED_UP);
             else if (buf == "s-") handleEvent(SPEED_DOWN);
             else if (buf == "c")  handleEvent(TOGGLE_CYCLE);
+            else if (buf == "Z")  cycleSound = !cycleSound;  // include sound modes in auto-cycle
 
             // ── Draw mode ─────────────────────────────────────────
-            else if (buf == "d")  { drawMode = true;  FastLED.clear(); FastLED.show(); }
-            else if (buf == "D")  { drawMode = false; selectAnim(animIdx); }
+            // Enter draw mode by restoring the last pushed image (so a phone
+            // reconnect resumes the drawing rather than wiping it).
+            else if (buf == "d")  { drawMode = true;  showBuf(frameBuf); }
+            else if (buf == "D")  { drawMode = false; drawCycle = false; selectAnim(animIdx); }
             else if (buf == "ps") { FastLED.show(); }
-            else if (buf == "pC") { FastLED.clear(); FastLED.show(); }
+            else if (buf == "pC") { memset(frameBuf, 0, sizeof(frameBuf)); FastLED.clear(); FastLED.show(); }
+
+            // ── Drawing state readback / save / load / cycle ──────
+            else if (buf == "g") {
+                captureGrid(frameBuf);
+                Serial.print(F("{\"frame\":\""));
+                printBase64(frameBuf, GRID_LEDS * 3);
+                Serial.println(F("\"}"));
+            }
+            else if (buf == "L") { printSlots(); }
+            else if (buf[0] == 'W' && buf.length() > 1) { saveSlot((uint8_t)buf.substring(1).toInt()); printSlots(); }
+            else if (buf[0] == 'X' && buf.length() > 1) { deleteSlot((uint8_t)buf.substring(1).toInt()); printSlots(); }
+            else if (buf[0] == 'R' && buf.length() > 1) {
+                if (loadSlot((uint8_t)buf.substring(1).toInt())) {
+                    drawMode = true; drawCycle = false; showBuf(frameBuf);
+                }
+            }
+            else if (buf == "Y") {
+                drawCycle = !drawCycle;
+                if (drawCycle) { drawMode = true; cycleIdx = -1; drawCycleStart = 0; }
+                else           { drawMode = false; selectAnim(animIdx); }
+                printSlots();
+            }
             else if (buf.startsWith("px")) {
                 uint8_t x, y, r, g, b;
                 if (sscanf(buf.c_str(), "px%hhu,%hhu,%hhu,%hhu,%hhu", &x, &y, &r, &g, &b) == 5)
@@ -819,10 +1013,18 @@ void handleSerial() {
                 Serial.print(F("\",\"bright\":")); Serial.print(brightness);
                 Serial.print(F(",\"speed\":"));    Serial.print(speedScale);
                 Serial.print(F(",\"cycle\":"));    Serial.print(autoCycle ? "true" : "false");
+                Serial.print(F(",\"cyclesound\":")); Serial.print(cycleSound ? "true" : "false");
                 Serial.print(F(",\"draw\":"));     Serial.print(drawMode  ? "true" : "false");
+                Serial.print(F(",\"drawcycle\":")); Serial.print(drawCycle ? "true" : "false");
+                Serial.print(F(",\"sd\":"));       Serial.print(sdOk ? "true" : "false");
                 Serial.print(F(",\"anims\":["));
                 for (uint8_t i = 0; i < NUM_ANIMS; i++) {
                     Serial.print('"'); Serial.print(anims[i].name); Serial.print('"');
+                    if (i < NUM_ANIMS - 1) Serial.print(',');
+                }
+                Serial.print(F("],\"sound\":["));
+                for (uint8_t i = 0; i < NUM_ANIMS; i++) {
+                    Serial.print(anims[i].sound ? '1' : '0');
                     if (i < NUM_ANIMS - 1) Serial.print(',');
                 }
                 Serial.println(F("]}"));
@@ -883,6 +1085,7 @@ void setup() {
     FastLED.setBrightness(brightness);
     FastLED.clear();
     FastLED.show();
+    sdOk = SD.begin(BUILTIN_SDCARD);   // false → saved drawings fall back to RAM
     delay(500);
     animStart = millis();
     if (anims[animIdx].init) anims[animIdx].init();
@@ -890,9 +1093,18 @@ void setup() {
 
 void loop() {
     uint32_t now = millis();
-    if (!drawMode) {
+    if (drawCycle) {
+        // Rotate through the occupied saved-drawing slots.
+        if (now - drawCycleStart >= DRAW_CYCLE_MS) {
+            drawCycleStart = now;
+            for (uint8_t step = 0; step < NUM_SLOTS; step++) {
+                cycleIdx = (cycleIdx + 1) % NUM_SLOTS;
+                if (slotOccupied(cycleIdx)) { loadSlot(cycleIdx); showBuf(frameBuf); break; }
+            }
+        }
+    } else if (!drawMode) {
         if (autoCycle && now - animStart >= ANIM_DURATION_MS)
-            handleEvent(NEXT_ANIM);
+            advanceCycle();
         anims[animIdx].draw(now);
     }
     pollEncoder();

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from typing import Any
 
 import serial  # pyserial
@@ -41,23 +42,33 @@ class SerialBridge:
             self._connected = True
             log.info("Serial connected: %s @ %d", self.port, self.baud)
             return True
-        except serial.SerialException as e:
+        except (serial.SerialException, OSError) as e:
             log.warning("Serial not available (%s): %s", self.port, e)
             self._connected = False
             return False
 
     def start(self, loop: asyncio.AbstractEventLoop):
-        """Call once from startup after connect().  Launches read thread and write coroutine."""
+        """Call once from startup.  Launches the reconnect supervisor and write coroutine."""
         self._loop = loop
-        if self._connected:
-            threading.Thread(target=self._read_thread, daemon=True).start()
-            loop.create_task(self._write_loop())
+        threading.Thread(target=self._serial_supervisor, daemon=True).start()
+        loop.create_task(self._write_loop())
 
-    # ── Read thread (blocking serial → asyncio) ───────────────────────
+    # ── Reconnect supervisor (blocking serial → asyncio) ──────────────
 
-    def _read_thread(self):
-        """Runs in a daemon thread.  Reads lines and schedules JSON parsing on the loop."""
-        while self._connected and self._ser:
+    def _serial_supervisor(self):
+        """Owns the serial port for the process lifetime: (re)opens on demand,
+        reads lines while connected, and recovers from unplug/replug without a
+        server restart."""
+        backoff = 0.5
+        while True:
+            if not self._connected:
+                if self.connect():
+                    backoff = 0.5
+                    asyncio.run_coroutine_threadsafe(self._on_reconnect(), self._loop)
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 3.0)
+                    continue
             try:
                 raw = self._ser.readline()
                 if raw:
@@ -66,19 +77,53 @@ class SerialBridge:
                         asyncio.run_coroutine_threadsafe(
                             self._on_status_line(line), self._loop
                         )
-            except serial.SerialException:
-                log.warning("Serial read error — disconnected?")
-                self._connected = False
+            except (serial.SerialException, OSError, TypeError):
+                log.warning("Serial read error — disconnected")
+                self._mark_disconnected()
+
+    def _mark_disconnected(self):
+        self._connected = False
+        try:
+            if self._ser:
+                self._ser.close()
+        except Exception:
+            pass
+        self._ser = None
+        if self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self.broadcast({
+                    "type": "serial_state", "connected": False,
+                    "msg": f"Teensy disconnected ({self.port})",
+                }),
+                self._loop,
+            )
+
+    async def _on_reconnect(self):
+        # Drop any frames queued while we were down, then resync clients.
+        while not self._write_queue.empty():
+            try:
+                self._write_queue.get_nowait()
+            except asyncio.QueueEmpty:
                 break
+        await self.broadcast({"type": "serial_state", "connected": True})
+        await self.query()
 
     async def _on_status_line(self, line: str):
         try:
             data = json.loads(line)
-            data["serial"] = True
-            self._status = data
-            await self.broadcast({"type": "status", **data})
         except json.JSONDecodeError:
-            pass
+            return
+        # Frame readback (base64) — forward without touching cached status.
+        if "frame" in data:
+            await self.broadcast({"type": "frame_data", "frame": data["frame"]})
+            return
+        # Saved-drawing slot list.
+        if "saved" in data:
+            await self.broadcast({"type": "saved", **data})
+            return
+        data["serial"] = True
+        self._status = data
+        await self.broadcast({"type": "status", **data})
 
     # ── Write loop (asyncio → blocking serial) ────────────────────────
 
@@ -86,7 +131,10 @@ class SerialBridge:
         while True:
             data = await self._write_queue.get()
             if self._ser and self._connected:
-                await asyncio.to_thread(self._ser.write, data)
+                try:
+                    await asyncio.to_thread(self._ser.write, data)
+                except (serial.SerialException, OSError):
+                    self._mark_disconnected()
 
     # ── Public send helpers ───────────────────────────────────────────
 

@@ -209,6 +209,72 @@ Connect with any serial terminal at 115200 baud. All commands are newline-termin
 
 ---
 
+## Video tools (25×25 clips)
+
+Helpers in `video/` for turning ordinary videos into clips sized for the wall and previewing them on the computer. They need `ffmpeg` (a system package) plus `numpy` and `opencv-python` (in `requirements.txt`); `fetch_samples.py` also needs `yt-dlp`.
+
+Run them from the `video/` directory:
+
+```bash
+cd video
+```
+
+**1. Fetch some test clips** (`fetch_samples.py`)
+
+Searches a curated list of terms (good 25×25 material) and, for each candidate, shows the title, length, channel, resolution, etc. and **asks before downloading**. Picked clips go into `samples/`, trimmed short and capped in resolution.
+
+```bash
+python fetch_samples.py --list                       # show the curated search terms
+python fetch_samples.py                               # ask per video, all categories
+python fetch_samples.py --category ambient --seconds 30
+python fetch_samples.py --category party --count 3    # offer 3 candidates per term
+python fetch_samples.py --yes                         # skip prompts, take the top result
+```
+
+At each prompt: **y** download · **n** skip · **a** download this and all remaining without asking · **q** quit.
+
+Flags: `--category {ambient,party,all}`, `--count` (candidates offered per term), `--seconds` (trim length, `0` = full video), `--height` (max download resolution), `--outdir`, `-y/--yes` (no prompts).
+
+**2. Convert a video to a `.wv25` clip** (`convert.py`)
+
+Square-crops the input, downscales to 25×25, and writes a compact `.wv25` file (12-byte header + raw RGB frames).
+
+```bash
+python convert.py samples/ambient/lava.mp4 -o lava.wv25
+python convert.py clip.webm -o clip.wv25 --fps 24 --start 5 --duration 8
+python convert.py clip.mp4 -o clip.wv25 --gamma 2.2   # darken washed-out clips
+```
+
+Flags: `-o/--output` (required), `--fps` (1–60, default 24), `--start`/`--duration` (seconds), `--crop {center,top,bottom}`, `--gamma` (baked into output, default 1.0 = none).
+
+**2b. Or batch-convert a whole folder** (`batch_convert.py`)
+
+Converts every video in a folder (default `samples/`, recursive) to a `.wv25` in an output folder, giving each a short tidy name (YouTube titles are long and messy). Skips files already converted unless `--overwrite`.
+
+```bash
+python batch_convert.py                               # samples/ -> out/
+python batch_convert.py samples -o out --fps 24
+python batch_convert.py samples --seconds 10 --overwrite
+```
+
+Flags: positional input folder (default `samples`), `-o/--outdir` (default `out`), `--fps`, `--seconds` (first N seconds of each), `--crop`, `--gamma`, `--overwrite`.
+
+**3. Preview it as LED pixels** (`simulate.py`)
+
+Plays a `.wv25` in a window, rendered as 25×25 square LED pixels with the WS2812B colour/brightness model — an approximation of how the wall will look.
+
+```bash
+python simulate.py lava.wv25 --loop
+python simulate.py clip.wv25 --brightness 180 --gamma 2.4 --scale 28
+```
+
+Flags: `--loop`, `--scale` (px per LED), `--gap` (black gap between cells), `--brightness` (0–255), `--gamma`, `--fps` (override).
+Keys while playing: **space** pause/play · **`[`** / **`]`** step · **`+`** / **`-`** brightness · **`,`** / **`.`** gamma · **`q`** quit.
+
+> On-wall playback from the Teensy's SD card is not implemented yet — for now these tools produce and preview clips on the computer.
+
+---
+
 ## Troubleshooting
 
 **"python" is not recognized**
