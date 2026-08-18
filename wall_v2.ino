@@ -21,7 +21,7 @@
 CRGB leds[NUM_LEDS];
 
 // ── Global tunables ───────────────────────────────────────────────
-uint8_t  brightness = 128;   // 0–255
+uint8_t  brightness = 32;   // 0–255
 uint8_t  speedScale = 128;   // 128 = 1×; 64 = 0.5×; 255 ≈ 2×
 bool     autoCycle  = true;
 bool     cycleSound = false;  // include mic-reactive anims in auto-cycle?
