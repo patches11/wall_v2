@@ -31,6 +31,56 @@ On subsequent runs, double-clicking `start.bat` is all you need.
 
 ---
 
+## Run automatically at boot (Windows)
+
+`start.bat` is the hands-on path: it prompts, pauses on errors, and stops when you close the window.
+For an always-on wall there are two extra scripts:
+
+- **`start-wall.ps1`** - the same startup sequence with no prompts and no pauses. Creates `.env` and the
+  certificate if missing, logs to `logs\wall_<date>.log`, and exits non-zero on failure.
+- **`install-autostart.ps1`** - one-time installer that wires it into Windows.
+
+**Install** (from an *elevated* PowerShell window - "At startup" tasks can only be registered by an admin):
+
+```powershell
+cd <this folder>
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-autostart.ps1
+```
+
+It creates a virtualenv at `%USERPROFILE%\.venvs\wall_v2`, installs the server dependencies into it, runs the
+setup checks once, opens inbound TCP 80/443 on the **Private** firewall profile, and registers a scheduled task
+called **Wall v2** that triggers *At startup* - before anyone logs in - and restarts itself within a minute if it
+dies. You are prompted for your Windows password because Task Scheduler needs it to run a task with no
+interactive session; it is kept in the encrypted credential store.
+
+Don't want to store the password? `-AsSystem` registers the task as `NT AUTHORITY\SYSTEM` instead. Caveat:
+SYSTEM cannot hydrate OneDrive "cloud only" files, so pin this folder locally first (`attrib +P /s /d` in the
+repo root).
+
+**Everyday commands**
+
+```powershell
+Start-ScheduledTask   -TaskName "Wall v2"     # start now, without rebooting
+Stop-ScheduledTask    -TaskName "Wall v2"     # stop the server
+Get-ScheduledTaskInfo -TaskName "Wall v2"     # LastRunTime / LastTaskResult (0 = fine)
+Get-Content .\logs\wall_*.log -Tail 40 -Wait  # live log
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-autostart.ps1 -Uninstall
+```
+
+**Worth knowing**
+
+- The task runs headless in session 0 - there is no window and no firewall prompt, which is why the installer
+  adds the rules itself. If your network is set to *Public*, the rules won't apply; the installer warns and
+  prints the one-liner to switch it to *Private*.
+- The service venv deliberately omits `numpy`/`opencv-python`; the `video/` tools keep using your normal Python.
+- **Give this PC a static IP or a DHCP reservation.** `gen_cert.py` bakes the current LAN address into the
+  certificate, so if the address moves, the CA you installed on your phone no longer matches and camera, motion
+  sensors and PWA install stop working. `start-wall.ps1` logs a `WARN` line when it notices the drift; fix it by
+  re-running `gen_cert.py` and reinstalling `cert.pem` on the phone.
+- The Teensy does not need to be plugged in at boot - the serial bridge polls and reconnects on its own.
+
+---
+
 ## Manual setup
 
 **1. Install dependencies**

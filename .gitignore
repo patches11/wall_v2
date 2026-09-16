@@ -6,3 +6,7 @@ __pycache__/
 # Downloaded test clips and converted output
 wall_v2_app/video/samples/
 *.wv25
+
+# Autostart logs
+logs/
+
